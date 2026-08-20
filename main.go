@@ -20,6 +20,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,11 +39,12 @@ import (
 const userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
 var (
-	xoxcPattern      = regexp.MustCompile(`xoxc-[A-Za-z0-9-]+`)
-	emojiNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,78}$`)
-	userIDPattern    = regexp.MustCompile(`^[UW][A-Z0-9]+$`)
-	Version          = "unknown"
-	Commit           = "unknown"
+	xoxcPattern           = regexp.MustCompile(`xoxc-[A-Za-z0-9-]+`)
+	emojiNamePattern      = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,78}$`)
+	imageExtensionPattern = regexp.MustCompile(`^\.[A-Za-z0-9]+$`)
+	userIDPattern         = regexp.MustCompile(`^[UW][A-Z0-9]+$`)
+	Version               = "unknown"
+	Commit                = "unknown"
 )
 
 type config struct {
@@ -57,6 +59,7 @@ type config struct {
 	images      string
 	imageWidth  int
 	imageHeight int
+	force       bool
 }
 
 func main() {
@@ -81,6 +84,7 @@ request token from local storage. It never writes or displays credentials.
 		Example: cliExample(`
 slackmoji add party-parrot ./party-parrot.gif --workspace cloudexchange-inc  # Upload an emoji
 slackmoji list party parrot                                                    # Search emoji
+slackmoji download party-parrot                                                # Save an emoji image
 slackmoji delete party-parrot --workspace cloudexchange-inc --yes             # Permanently delete
 		`),
 		SilenceErrors: true,
@@ -95,8 +99,59 @@ slackmoji delete party-parrot --workspace cloudexchange-inc --yes             # 
 	root.SetVersionTemplate("{{.Version}}\n")
 	root.PersistentFlags().StringVarP(&cfg.workspace, "workspace", "w", "", "Slack subdomain, e.g. cloudexchange-inc")
 	root.PersistentFlags().StringVarP(&cfg.profile, "profile", "p", "", "Chrome profile, e.g. 'Profile 1'")
-	root.AddCommand(newAddCommand(&cfg), newDeleteCommand(&cfg), newListCommand(&cfg))
+	root.AddCommand(newAddCommand(&cfg), newDeleteCommand(&cfg), newDownloadCommand(&cfg), newListCommand(&cfg))
 	return root
+}
+
+func newDownloadCommand(cfg *config) *cobra.Command {
+	command := &cobra.Command{
+		Use:     "download <emoji-name> [destination]",
+		Aliases: []string{"get"},
+		Short:   "download a custom emoji's source image",
+		Long: cliHelp(`
+Download the original image for an exact custom emoji name. Without a
+destination, slackmoji saves it in the current directory using the emoji name
+and the extension Slack provides in the image URL.
+		`),
+		Example: cliExample(`
+slackmoji download party-parrot                         # Saves ./party-parrot.gif
+slackmoji download party-parrot ./images/party.gif      # Choose the destination
+slackmoji download party-parrot --force                 # Replace an existing file
+		`),
+		Args: cobra.RangeArgs(1, 2),
+		RunE: func(_ *cobra.Command, args []string) error {
+			if !emojiNamePattern.MatchString(args[0]) {
+				return errors.New("emoji name must be 1-79 lowercase letters, numbers, hyphens, or underscores")
+			}
+			client, hostname, cookies, token, err := connect(*cfg)
+			if err != nil {
+				return err
+			}
+			payload, err := listEmoji(client, hostname, cookies, token, []string{args[0]}, nil, 1, 100)
+			if err != nil {
+				return err
+			}
+			emoji, err := emojiNamed(payload, args[0])
+			if err != nil {
+				return err
+			}
+			destination := ""
+			if len(args) == 2 {
+				destination = args[1]
+			}
+			if destination == "" {
+				destination = args[0] + emojiFileExtension(stringValue(emoji, "url"))
+			}
+			if err := downloadEmoji(client, stringValue(emoji, "url"), destination, cfg.force); err != nil {
+				return err
+			}
+			color.New(color.FgGreen, color.Bold).Printf("Downloaded :%s:", args[0])
+			fmt.Printf(" to %s\n", destination)
+			return nil
+		},
+	}
+	command.Flags().BoolVarP(&cfg.force, "force", "f", false, "replace an existing destination file")
+	return command
 }
 
 func newAddCommand(cfg *config) *cobra.Command {
@@ -717,6 +772,80 @@ func listEmojiWithUploaderFilters(client *http.Client, hostname string, cookies 
 	}
 	uploaderIDs = append(uploaderIDs, resolvedIDs...)
 	return listEmoji(client, hostname, cookies, token, queries, uniqueStrings(uploaderIDs), page, count)
+}
+
+func emojiNamed(payload map[string]any, name string) (map[string]any, error) {
+	emojis, ok := payload["emoji"].([]any)
+	if !ok {
+		return nil, errors.New("Slack returned an unexpected emoji list format; retry with --json")
+	}
+	for _, item := range emojis {
+		emoji, ok := item.(map[string]any)
+		if ok && stringValue(emoji, "name") == name {
+			if stringValue(emoji, "url") == "" {
+				return nil, fmt.Errorf("emoji :%s: does not have a downloadable image", name)
+			}
+			return emoji, nil
+		}
+	}
+	return nil, fmt.Errorf("custom emoji not found: :%s:", name)
+}
+
+func emojiFileExtension(imageURL string) string {
+	parsed, err := url.Parse(imageURL)
+	if err != nil {
+		return ""
+	}
+	extension := filepath.Ext(parsed.Path)
+	if len(extension) > 10 || !imageExtensionPattern.MatchString(extension) {
+		return ""
+	}
+	return extension
+}
+
+func downloadEmoji(client *http.Client, imageURL, destination string, force bool) error {
+	if imageURL == "" {
+		return errors.New("Slack did not provide an image URL")
+	}
+	if info, err := os.Stat(destination); err == nil {
+		if info.IsDir() {
+			return fmt.Errorf("destination is a directory: %s", destination)
+		}
+		if !force {
+			return fmt.Errorf("destination already exists: %s (use --force to replace it)", destination)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	response, err := client.Get(imageURL)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return fmt.Errorf("image returned HTTP %d", response.StatusCode)
+	}
+	file, err := os.CreateTemp(filepath.Dir(destination), ".slackmoji-download-*")
+	if err != nil {
+		return err
+	}
+	temporary := file.Name()
+	defer os.Remove(temporary)
+	if err := file.Chmod(0o644); err != nil {
+		file.Close()
+		return err
+	}
+	if _, err := io.Copy(file, response.Body); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporary, destination); err != nil {
+		return err
+	}
+	return nil
 }
 
 func teamIDFromEmojiList(payload map[string]any) string {

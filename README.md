@@ -40,6 +40,12 @@ slackmoji list
 slackmoji list party parrot
 slackmoji --workspace cloudexchange-inc --page 2 --count 50 list shellder
 
+# Download an emoji's original image. The default filename uses the emoji name
+# and the extension Slack provides; choose a path explicitly to override it.
+slackmoji download party-parrot
+slackmoji download party-parrot ./images/party-parrot.gif
+slackmoji download party-parrot --force  # Replace an existing file
+
 # Complete list response, including pagination and metadata
 slackmoji --workspace cloudexchange-inc --json list shellder
 
