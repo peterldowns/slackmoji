@@ -1,0 +1,27 @@
+[tools]
+go = "1.27.0"
+"go:github.com/sethvargo/ratchet" = "0.12.0"
+
+[tasks.lint]
+description = "Run static checks and verify Go modules are tidy"
+run = [
+  "env -u GOROOT -u GOBIN go vet ./...",
+  "env -u GOROOT -u GOBIN go mod tidy",
+  "git diff --exit-code -- go.mod go.sum",
+]
+
+[tasks.test]
+description = "Run the test suite"
+run = "env -u GOROOT -u GOBIN go test -count=1 ./..."
+
+[tasks.test-race]
+description = "Run the test suite with the race detector"
+run = "env -u GOROOT -u GOBIN go test -count=1 -race ./..."
+
+[tasks.build]
+description = "Build a versioned local slackmoji binary in bin/"
+run = """
+mkdir -p bin
+ldflags=$(./scripts/golang-ldflags.sh)
+env -u GOROOT -u GOBIN go build -trimpath -ldflags "$ldflags" -o bin/slackmoji .
+"""
