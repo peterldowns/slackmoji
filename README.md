@@ -34,6 +34,11 @@ slackmoji --workspace cloudexchange-inc --page 2 --count 50 list shellder
 # Complete list response, including pagination and metadata
 slackmoji --workspace cloudexchange-inc --json list shellder
 
+# Inline previews are automatic in Ghostty and iTerm2.
+slackmoji list --images none              # Disable previews
+slackmoji list --image-width 8 --image-height 4
+slackmoji list --images kitty             # Force a supported protocol
+
 # Permanent delete; --yes is required deliberately.
 slackmoji --workspace cloudexchange-inc delete party-parrot --yes
 ```
@@ -43,7 +48,7 @@ Use `--profile "Profile 1"` before the command if the signed-in workspace is in 
 ## Requirements
 
 - macOS with Google Chrome and an active Slack browser session
-- Go 1.23+
+- Go 1.25+
 - Permission to read the `Chrome Safe Storage` Keychain item when macOS asks
 
 The tool uses Slack's browser-facing emoji endpoints, so Slack may change the request format in the future.

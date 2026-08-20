@@ -8,9 +8,15 @@ import (
 	"crypto/hmac"
 	"crypto/sha1"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/draw"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -25,6 +31,7 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
+	_ "golang.org/x/image/webp"
 	_ "modernc.org/sqlite"
 )
 
@@ -37,14 +44,17 @@ var (
 )
 
 type config struct {
-	workspace string
-	profile   string
-	yes       bool
-	page      int
-	count     int
-	json      bool
-	details   bool
-	uploader  []string
+	workspace   string
+	profile     string
+	yes         bool
+	page        int
+	count       int
+	json        bool
+	details     bool
+	uploader    []string
+	images      string
+	imageWidth  int
+	imageHeight int
 }
 
 func main() {
@@ -167,7 +177,11 @@ slackmoji list --json shellder          # Print Slack's complete response
 			if err != nil {
 				return err
 			}
-			return printEmojiList(payload, cfg.json, cfg.details)
+			renderer, err := newImageRenderer(client, cfg.images, cfg.imageWidth, cfg.imageHeight)
+			if err != nil {
+				return err
+			}
+			return printEmojiList(payload, cfg.json, cfg.details, renderer)
 		},
 	}
 	command.Flags().IntVar(&cfg.page, "page", 1, "results page")
@@ -175,6 +189,9 @@ slackmoji list --json shellder          # Print Slack's complete response
 	command.Flags().BoolVar(&cfg.json, "json", false, "print Slack's complete JSON response")
 	command.Flags().BoolVar(&cfg.details, "details", false, "include image URLs and Slack IDs")
 	command.Flags().StringSliceVar(&cfg.uploader, "uploader", nil, "filter by uploader name or Slack user ID (repeatable)")
+	command.Flags().StringVar(&cfg.images, "images", "auto", "inline images: auto, kitty, iterm2, or none")
+	command.Flags().IntVar(&cfg.imageWidth, "image-width", 6, "inline image width in terminal cells")
+	command.Flags().IntVar(&cfg.imageHeight, "image-height", 3, "inline image height in terminal cells")
 	return command
 }
 
@@ -863,7 +880,7 @@ func requireOK(payload map[string]any, action string) error {
 	return nil
 }
 
-func printEmojiList(payload map[string]any, asJSON, details bool) error {
+func printEmojiList(payload map[string]any, asJSON, details bool, renderer *imageRenderer) error {
 	if asJSON {
 		encoded, _ := json.MarshalIndent(payload, "", "  ")
 		fmt.Println(string(encoded))
@@ -896,10 +913,135 @@ func printEmojiList(payload map[string]any, asJSON, details bool) error {
 		if details {
 			printEmojiDetails(emoji)
 		}
+		if renderer != nil && renderer.mode != imageModeNone {
+			if err := renderer.render(stringValue(emoji, "url")); err != nil {
+				fmt.Fprintln(os.Stderr, color.New(color.Faint).Sprintf("  image unavailable: %v", err))
+			}
+		}
 	}
 	if paging, ok := payload["paging"].(map[string]any); ok {
 		if total, ok := paging["total"].(float64); ok {
 			fmt.Fprintf(os.Stderr, "%.0f matching emoji\n", total)
+		}
+	}
+	return nil
+}
+
+type imageMode string
+
+const (
+	imageModeNone   imageMode = "none"
+	imageModeKitty  imageMode = "kitty"
+	imageModeITerm2 imageMode = "iterm2"
+	maxEmojiBytes             = 700 << 10
+)
+
+type imageRenderer struct {
+	client        *http.Client
+	mode          imageMode
+	width, height int
+	nextID        int
+}
+
+func newImageRenderer(client *http.Client, requested string, width, height int) (*imageRenderer, error) {
+	if width < 1 || height < 1 {
+		return nil, errors.New("--image-width and --image-height must be positive")
+	}
+	mode := imageMode(requested)
+	if mode == "auto" {
+		mode = detectedImageMode()
+	}
+	if mode != imageModeNone && mode != imageModeKitty && mode != imageModeITerm2 {
+		return nil, errors.New("--images must be auto, kitty, iterm2, or none")
+	}
+	return &imageRenderer{client: client, mode: mode, width: width, height: height, nextID: 1}, nil
+}
+
+func detectedImageMode() imageMode {
+	info, err := os.Stdout.Stat()
+	if err != nil || info.Mode()&os.ModeCharDevice == 0 {
+		return imageModeNone
+	}
+	switch os.Getenv("TERM_PROGRAM") {
+	case "ghostty":
+		return imageModeKitty
+	case "iTerm.app":
+		return imageModeITerm2
+	}
+	if os.Getenv("KITTY_WINDOW_ID") != "" {
+		return imageModeKitty
+	}
+	return imageModeNone
+}
+
+func (renderer *imageRenderer) render(imageURL string) error {
+	if imageURL == "" {
+		return errors.New("Slack did not provide an image URL")
+	}
+	response, err := renderer.client.Get(imageURL)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return fmt.Errorf("image returned HTTP %d", response.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxEmojiBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(data) > maxEmojiBytes {
+		return fmt.Errorf("image exceeds %d KiB", maxEmojiBytes>>10)
+	}
+	fmt.Fprintln(os.Stdout)
+	switch renderer.mode {
+	case imageModeITerm2:
+		renderITermImage(data, renderer.width, renderer.height)
+	case imageModeKitty:
+		if err := renderer.renderKittyImage(data); err != nil {
+			return err
+		}
+	}
+	// Neither protocol advances the cursor consistently, so reserve the cells
+	// ourselves before rendering the next list item.
+	fmt.Fprint(os.Stdout, strings.Repeat("\n", renderer.height))
+	return nil
+}
+
+func renderITermImage(data []byte, width, height int) {
+	name := base64.StdEncoding.EncodeToString([]byte("slackmoji-emoji"))
+	content := base64.StdEncoding.EncodeToString(data)
+	fmt.Fprintf(os.Stdout, "\x1b]1337;File=name=%s;size=%d;width=%d;height=%d;preserveAspectRatio=1;inline=1:%s\a", name, len(data), width, height, content)
+}
+
+func (renderer *imageRenderer) renderKittyImage(data []byte) error {
+	decoded, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return errors.New("Kitty rendering supports PNG, JPEG, and GIF emoji")
+	}
+	bounds := decoded.Bounds()
+	if bounds.Dx() <= 0 || bounds.Dy() <= 0 || bounds.Dx()*bounds.Dy() > 4_000_000 {
+		return errors.New("image dimensions are unsupported")
+	}
+	rgba := image.NewNRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+	draw.Draw(rgba, rgba.Bounds(), decoded, bounds.Min, draw.Src)
+	encoded := base64.StdEncoding.EncodeToString(rgba.Pix)
+	id := renderer.nextID
+	renderer.nextID++
+	const chunkSize = 4096
+	for offset := 0; offset < len(encoded); offset += chunkSize {
+		end := offset + chunkSize
+		if end > len(encoded) {
+			end = len(encoded)
+		}
+		more := 0
+		if end < len(encoded) {
+			more = 1
+		}
+		if offset == 0 {
+			fmt.Fprintf(os.Stdout, "\x1b_Ga=T,f=32,s=%d,v=%d,i=%d,c=%d,r=%d,q=2,m=%d;%s\x1b\\", rgba.Bounds().Dx(), rgba.Bounds().Dy(), id, renderer.width, renderer.height, more, encoded[offset:end])
+		} else {
+			fmt.Fprintf(os.Stdout, "\x1b_Gm=%d;%s\x1b\\", more, encoded[offset:end])
 		}
 	}
 	return nil
