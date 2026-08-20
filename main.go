@@ -41,6 +41,8 @@ var (
 	xoxcPattern      = regexp.MustCompile(`xoxc-[A-Za-z0-9-]+`)
 	emojiNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,78}$`)
 	userIDPattern    = regexp.MustCompile(`^[UW][A-Z0-9]+$`)
+	Version          = "unknown"
+	Commit           = "unknown"
 )
 
 type config struct {
@@ -68,8 +70,9 @@ func main() {
 func newRootCommand() *cobra.Command {
 	var cfg config
 	root := &cobra.Command{
-		Use:   "slackmoji",
-		Short: color.New(color.Faint).Sprint("Manage custom Slack emoji through your signed-in Chrome session."),
+		Use:     "slackmoji",
+		Version: fmt.Sprintf("%s+commit.%s", Version, Commit),
+		Short:   color.New(color.Faint).Sprint("Manage custom Slack emoji through your signed-in Chrome session."),
 		Long: cliHelp(`
 slackmoji reads Chrome's Safe Storage secret from your Keychain, decrypts only
 the selected Slack workspace cookies in memory, and discovers Slack's browser
@@ -89,6 +92,7 @@ slackmoji delete party-parrot --workspace cloudexchange-inc --yes             # 
 			return cmd.Help()
 		},
 	}
+	root.SetVersionTemplate("{{.Version}}\n")
 	root.PersistentFlags().StringVarP(&cfg.workspace, "workspace", "w", "", "Slack subdomain, e.g. cloudexchange-inc")
 	root.PersistentFlags().StringVarP(&cfg.profile, "profile", "p", "", "Chrome profile, e.g. 'Profile 1'")
 	root.AddCommand(newAddCommand(&cfg), newDeleteCommand(&cfg), newListCommand(&cfg))

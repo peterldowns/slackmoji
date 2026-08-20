@@ -10,6 +10,15 @@ It reads Chrome's Safe Storage secret from your Keychain, decrypts only the sele
 go install github.com/peterldowns/slackmoji@latest
 ```
 
+### Download a binary
+
+Visit [the latest GitHub release](https://github.com/peterldowns/slackmoji/releases/latest), or download a platform binary directly:
+
+- [darwin-arm64](https://github.com/peterldowns/slackmoji/releases/latest/download/slackmoji-darwin-arm64)
+- [darwin-amd64](https://github.com/peterldowns/slackmoji/releases/latest/download/slackmoji-darwin-amd64)
+- [linux-arm64](https://github.com/peterldowns/slackmoji/releases/latest/download/slackmoji-linux-arm64)
+- [linux-amd64](https://github.com/peterldowns/slackmoji/releases/latest/download/slackmoji-linux-amd64)
+
 Or, from this checkout:
 
 ```sh
