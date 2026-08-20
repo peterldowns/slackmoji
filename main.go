@@ -1,0 +1,662 @@
+// slackmoji manages custom Slack emoji using the signed-in Google Chrome session on macOS.
+package main
+
+import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/sha1"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+const userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+
+var (
+	xoxcPattern      = regexp.MustCompile(`xoxc-[A-Za-z0-9-]+`)
+	emojiNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,78}$`)
+)
+
+type config struct {
+	workspace string
+	profile   string
+	yes       bool
+	page      int
+	count     int
+	json      bool
+}
+
+func main() {
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	flags := flag.NewFlagSet("slackmoji", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	var cfg config
+	flags.StringVar(&cfg.workspace, "workspace", "", "Slack subdomain (for example: cloudexchange-inc)")
+	flags.StringVar(&cfg.profile, "profile", "", "Chrome profile name (for example: Profile 1)")
+	flags.BoolVar(&cfg.yes, "yes", false, "Confirm a permanent delete")
+	flags.IntVar(&cfg.page, "page", 1, "List result page")
+	flags.IntVar(&cfg.count, "count", 100, "List results per page (1-100)")
+	flags.BoolVar(&cfg.json, "json", false, "Print complete JSON for list")
+	flags.Usage = usage
+	if err := flags.Parse(normalizeGlobalFlags(args)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	rest := flags.Args()
+	if len(rest) == 0 || rest[0] == "help" || rest[0] == "-h" || rest[0] == "--help" {
+		usage()
+		return nil
+	}
+	command := rest[0]
+	rest = rest[1:]
+	if command != "add" && command != "delete" && command != "list" {
+		return fmt.Errorf("unknown command %q (expected add, delete, or list)", command)
+	}
+	if command == "add" && len(rest) != 2 {
+		return errors.New("usage: slackmoji [--workspace WORKSPACE] add EMOJI_NAME IMAGE")
+	}
+	if command == "delete" && len(rest) != 1 {
+		return errors.New("usage: slackmoji [--workspace WORKSPACE] delete EMOJI_NAME --yes")
+	}
+	if command == "list" && cfg.page < 1 || command == "list" && (cfg.count < 1 || cfg.count > 100) {
+		return errors.New("--page must be positive and --count must be between 1 and 100")
+	}
+	if command == "delete" && !cfg.yes {
+		return errors.New("refusing to delete without --yes")
+	}
+	if (command == "add" || command == "delete") && !emojiNamePattern.MatchString(rest[0]) {
+		return errors.New("emoji name must be 1-79 lowercase letters, numbers, hyphens, or underscores")
+	}
+	if command == "add" {
+		if info, err := os.Stat(rest[1]); err != nil || info.IsDir() {
+			return fmt.Errorf("image not found: %s", rest[1])
+		}
+	}
+
+	chromeRoot, err := chromeRoot()
+	if err != nil {
+		return err
+	}
+	key, err := chromeCookieKey()
+	if err != nil {
+		return err
+	}
+	if cfg.workspace == "" {
+		cfg.workspace, err = chooseWorkspace(chromeRoot, cfg.profile)
+		if err != nil {
+			return err
+		}
+	}
+	hostname, err := normalizeWorkspace(cfg.workspace)
+	if err != nil {
+		return err
+	}
+	profile, cookies, err := chooseProfile(chromeRoot, cfg.profile, hostname, key)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	token, err := selectToken(client, hostname, cookies, profile)
+	if err != nil {
+		return err
+	}
+
+	switch command {
+	case "add":
+		if err := uploadEmoji(client, hostname, cookies, token, rest[0], rest[1]); err != nil {
+			return err
+		}
+		fmt.Printf("Uploaded :%s: to %s\n", rest[0], hostname)
+	case "delete":
+		if err := deleteEmoji(client, hostname, cookies, token, rest[0]); err != nil {
+			return err
+		}
+		fmt.Printf("Deleted :%s: from %s\n", rest[0], hostname)
+	case "list":
+		payload, err := listEmoji(client, hostname, cookies, token, rest, cfg.page, cfg.count)
+		if err != nil {
+			return err
+		}
+		return printEmojiList(payload, cfg.json)
+	}
+	return nil
+}
+
+// Go's flag package stops parsing at the command name. Accept global flags on
+// either side of it so `slackmoji delete name --yes` works naturally.
+func normalizeGlobalFlags(args []string) []string {
+	valueFlags := map[string]bool{"--workspace": true, "--profile": true, "--page": true, "--count": true}
+	boolFlags := map[string]bool{"--yes": true, "--json": true, "--help": true, "-h": true}
+	var flags, positional []string
+	for i := 0; i < len(args); i++ {
+		argument := args[i]
+		name := argument
+		if equals := strings.IndexByte(argument, '='); equals >= 0 {
+			name = argument[:equals]
+		}
+		if boolFlags[name] || strings.Contains(argument, "=") && valueFlags[name] {
+			flags = append(flags, argument)
+			continue
+		}
+		if valueFlags[name] {
+			flags = append(flags, argument)
+			if i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+			continue
+		}
+		positional = append(positional, argument)
+	}
+	return append(flags, positional...)
+}
+
+func usage() {
+	fmt.Fprint(os.Stderr, `slackmoji manages custom Slack emoji through your signed-in Chrome session.
+
+Usage:
+  slackmoji [--workspace WORKSPACE] [--profile PROFILE] add EMOJI_NAME IMAGE
+  slackmoji [--workspace WORKSPACE] [--profile PROFILE] delete EMOJI_NAME --yes
+  slackmoji [--workspace WORKSPACE] [--profile PROFILE] [--page N] [--count N] [--json] list [SEARCH_TERM...]
+
+When --workspace is omitted, slackmoji interactively offers Slack workspaces found in Chrome.
+
+Examples:
+  slackmoji --workspace cloudexchange-inc add party-parrot ./party-parrot.gif
+  slackmoji list party parrot
+  slackmoji --workspace cloudexchange-inc delete party-parrot --yes
+`)
+}
+
+func chromeRoot() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	root := filepath.Join(home, "Library", "Application Support", "Google", "Chrome")
+	if info, err := os.Stat(root); err != nil || !info.IsDir() {
+		return "", fmt.Errorf("Chrome data directory not found: %s", root)
+	}
+	return root, nil
+}
+
+func chromeCookieKey() ([]byte, error) {
+	output, err := exec.Command("security", "find-generic-password", "-w", "-a", "Chrome", "-s", "Chrome Safe Storage").Output()
+	if err != nil || len(bytes.TrimSpace(output)) == 0 {
+		return nil, errors.New("could not read Chrome Safe Storage from the macOS Keychain")
+	}
+	return pbkdf2SHA1(bytes.TrimSpace(output), []byte("saltysalt"), 1003, 16), nil
+}
+
+func pbkdf2SHA1(password, salt []byte, iterations, length int) []byte {
+	result := make([]byte, 0, length)
+	for block := 1; len(result) < length; block++ {
+		mac := hmac.New(sha1.New, password)
+		mac.Write(salt)
+		mac.Write([]byte{byte(block >> 24), byte(block >> 16), byte(block >> 8), byte(block)})
+		u := mac.Sum(nil)
+		t := append([]byte(nil), u...)
+		for round := 1; round < iterations; round++ {
+			mac = hmac.New(sha1.New, password)
+			mac.Write(u)
+			u = mac.Sum(nil)
+			for i := range t {
+				t[i] ^= u[i]
+			}
+		}
+		result = append(result, t...)
+	}
+	return result[:length]
+}
+
+func chromeProfiles(root string) ([]string, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
+	var profiles []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			if info, err := os.Stat(filepath.Join(root, entry.Name(), "Cookies")); err == nil && !info.IsDir() {
+				profiles = append(profiles, entry.Name())
+			}
+		}
+	}
+	sort.Strings(profiles)
+	if len(profiles) == 0 {
+		return nil, errors.New("no Chrome profiles with a Cookies database were found")
+	}
+	return profiles, nil
+}
+
+func copyCookieDB(profilePath string) (func(), string, error) {
+	temp, err := os.MkdirTemp("", "slackmoji-cookies-")
+	if err != nil {
+		return nil, "", err
+	}
+	cleanup := func() { _ = os.RemoveAll(temp) }
+	source := filepath.Join(profilePath, "Cookies")
+	destination := filepath.Join(temp, "Cookies")
+	if err := copyFile(source, destination); err != nil {
+		cleanup()
+		return nil, "", err
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(source + suffix); err == nil {
+			if err := copyFile(source+suffix, destination+suffix); err != nil {
+				cleanup()
+				return nil, "", err
+			}
+		}
+	}
+	return cleanup, destination, nil
+}
+
+func copyFile(source, destination string) error {
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(destination)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+func cookiesForWorkspace(profilePath, hostname string, key []byte) (map[string]string, error) {
+	cleanup, dbPath, err := copyCookieDB(profilePath)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT host_key, name, encrypted_value, path, LENGTH(path) FROM cookies WHERE host_key LIKE '%slack.com%' ORDER BY LENGTH(path) DESC, name ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cookies := map[string]string{}
+	for rows.Next() {
+		var host, name, path string
+		var encrypted []byte
+		var pathLength int
+		if err := rows.Scan(&host, &name, &encrypted, &path, &pathLength); err != nil {
+			return nil, err
+		}
+		if matchesWorkspace(host, hostname) && cookies[name] == "" {
+			value, err := decryptChromeCookie(encrypted, key)
+			if err != nil {
+				return nil, err
+			}
+			cookies[name] = value
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if cookies["d"] == "" {
+		return nil, fmt.Errorf("no signed-in Slack session for %s", hostname)
+	}
+	return cookies, nil
+}
+
+func decryptChromeCookie(encrypted, key []byte) (string, error) {
+	if len(encrypted) == 0 {
+		return "", nil
+	}
+	if !bytes.HasPrefix(encrypted, []byte("v10")) {
+		return string(encrypted), nil
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+	if len(encrypted[3:]) == 0 || len(encrypted[3:])%aes.BlockSize != 0 {
+		return "", errors.New("invalid Chrome cookie ciphertext")
+	}
+	plain := make([]byte, len(encrypted)-3)
+	cipher.NewCBCDecrypter(block, bytes.Repeat([]byte(" "), aes.BlockSize)).CryptBlocks(plain, encrypted[3:])
+	if len(plain) == 0 || int(plain[len(plain)-1]) > len(plain) {
+		return "", errors.New("invalid Chrome cookie padding")
+	}
+	padLength := int(plain[len(plain)-1])
+	for _, b := range plain[len(plain)-padLength:] {
+		if int(b) != padLength {
+			return "", errors.New("invalid Chrome cookie padding")
+		}
+	}
+	plain = plain[:len(plain)-padLength]
+	if utf8ish(plain) {
+		return string(plain), nil
+	}
+	if len(plain) >= 32 && utf8ish(plain[32:]) {
+		return string(plain[32:]), nil
+	}
+	return "", errors.New("failed to decode a Chrome cookie value")
+}
+
+func utf8ish(value []byte) bool {
+	return bytes.ToValidUTF8(value, []byte("?")) != nil && strings.IndexRune(string(value), '\uFFFD') == -1
+}
+
+func matchesWorkspace(cookieHost, hostname string) bool {
+	domain := strings.TrimPrefix(cookieHost, ".")
+	return hostname == domain || strings.HasSuffix(hostname, "."+domain)
+}
+
+func normalizeWorkspace(workspace string) (string, error) {
+	hostname := strings.TrimSuffix(strings.TrimPrefix(workspace, "https://"), "/")
+	if !strings.Contains(hostname, ".") {
+		hostname += ".slack.com"
+	}
+	if !strings.HasSuffix(hostname, ".slack.com") {
+		return "", errors.New("workspace must be a Slack subdomain, such as cloudexchange-inc")
+	}
+	return hostname, nil
+}
+
+func chooseWorkspace(root, requestedProfile string) (string, error) {
+	profiles, err := chromeProfiles(root)
+	if err != nil {
+		return "", err
+	}
+	if requestedProfile != "" {
+		profiles = []string{requestedProfile}
+	}
+	workspaces := map[string]bool{}
+	for _, profile := range profiles {
+		for _, host := range slackCookieHosts(filepath.Join(root, profile)) {
+			workspaces[host] = true
+		}
+	}
+	if len(workspaces) == 0 {
+		return "", errors.New("no Slack workspaces were found in Chrome")
+	}
+	options := make([]string, 0, len(workspaces))
+	for host := range workspaces {
+		options = append(options, host)
+	}
+	sort.Strings(options)
+	if len(options) == 1 {
+		return options[0], nil
+	}
+	fmt.Fprintln(os.Stderr, "Select a Slack workspace:")
+	for i, workspace := range options {
+		fmt.Fprintf(os.Stderr, "  %d) %s\n", i+1, workspace)
+	}
+	fmt.Fprint(os.Stderr, "> ")
+	var choice string
+	if _, err := fmt.Fscanln(os.Stdin, &choice); err != nil {
+		return "", errors.New("could not read workspace selection")
+	}
+	n, err := strconv.Atoi(choice)
+	if err != nil || n < 1 || n > len(options) {
+		return "", errors.New("invalid workspace selection")
+	}
+	return options[n-1], nil
+}
+
+func slackCookieHosts(profilePath string) []string {
+	cleanup, dbPath, err := copyCookieDB(profilePath)
+	if err != nil {
+		return nil
+	}
+	defer cleanup()
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		return nil
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT DISTINCT host_key FROM cookies WHERE name = 'd' AND host_key LIKE '%.slack.com'`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var hosts []string
+	for rows.Next() {
+		var host string
+		if rows.Scan(&host) == nil {
+			host = strings.TrimPrefix(host, ".")
+			if host != "slack.com" {
+				hosts = append(hosts, host)
+			}
+		}
+	}
+	return hosts
+}
+
+func chooseProfile(root, requested, hostname string, key []byte) (string, map[string]string, error) {
+	profiles, err := chromeProfiles(root)
+	if err != nil {
+		return "", nil, err
+	}
+	if requested != "" {
+		found := false
+		for _, profile := range profiles {
+			if profile == requested {
+				found = true
+			}
+		}
+		if !found {
+			return "", nil, fmt.Errorf("unknown Chrome profile %q", requested)
+		}
+		cookies, err := cookiesForWorkspace(filepath.Join(root, requested), hostname, key)
+		return filepath.Join(root, requested), cookies, err
+	}
+	for _, profile := range profiles {
+		path := filepath.Join(root, profile)
+		cookies, err := cookiesForWorkspace(path, hostname, key)
+		if err == nil {
+			return path, cookies, nil
+		}
+	}
+	return "", nil, fmt.Errorf("no signed-in Slack session for %s was found in Chrome", hostname)
+}
+
+func findTokens(profilePath string) ([]string, error) {
+	files, err := os.ReadDir(filepath.Join(profilePath, "Local Storage", "leveldb"))
+	if err != nil {
+		return nil, errors.New("Slack local storage was not found in the selected Chrome profile")
+	}
+	seen := map[string]bool{}
+	for _, file := range files {
+		if file.IsDir() || (!strings.HasSuffix(file.Name(), ".ldb") && !strings.HasSuffix(file.Name(), ".log")) {
+			continue
+		}
+		contents, err := os.ReadFile(filepath.Join(profilePath, "Local Storage", "leveldb", file.Name()))
+		if err != nil {
+			continue
+		}
+		for _, token := range xoxcPattern.FindAllString(string(contents), -1) {
+			seen[token] = true
+		}
+	}
+	if len(seen) == 0 {
+		return nil, errors.New("could not find Slack's browser request token; open Slack in Chrome and retry")
+	}
+	tokens := make([]string, 0, len(seen))
+	for token := range seen {
+		tokens = append(tokens, token)
+	}
+	sort.Strings(tokens)
+	return tokens, nil
+}
+
+func requestHeaders(hostname string, cookies map[string]string) http.Header {
+	pairs := make([]string, 0, len(cookies))
+	for name, value := range cookies {
+		pairs = append(pairs, name+"="+value)
+	}
+	sort.Strings(pairs)
+	headers := make(http.Header)
+	headers.Set("Accept", "*/*")
+	headers.Set("Origin", "https://"+hostname)
+	headers.Set("Referer", "https://"+hostname+"/customize/emoji")
+	headers.Set("User-Agent", userAgent)
+	headers.Set("Cookie", strings.Join(pairs, "; "))
+	return headers
+}
+
+func postForm(client *http.Client, hostname string, cookies map[string]string, endpoint string, fields map[string]string, imagePath string) (map[string]any, error) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for key, value := range fields {
+		if err := writer.WriteField(key, value); err != nil {
+			return nil, err
+		}
+	}
+	if imagePath != "" {
+		file, err := os.Open(imagePath)
+		if err != nil {
+			return nil, fmt.Errorf("image not found: %s", imagePath)
+		}
+		defer file.Close()
+		part, err := writer.CreateFormFile("image", filepath.Base(imagePath))
+		if err != nil {
+			return nil, err
+		}
+		if _, err := io.Copy(part, file); err != nil {
+			return nil, err
+		}
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://"+hostname+"/api/"+endpoint, &body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = requestHeaders(hostname, cookies)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	response, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		return nil, errors.New("Slack rejected the Chrome session; refresh Slack in Chrome and retry")
+	}
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return nil, fmt.Errorf("Slack returned HTTP %d", response.StatusCode)
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return nil, errors.New("Slack returned a non-JSON response")
+	}
+	return payload, nil
+}
+
+func selectToken(client *http.Client, hostname string, cookies map[string]string, profilePath string) (string, error) {
+	tokens, err := findTokens(profilePath)
+	if err != nil {
+		return "", err
+	}
+	for _, token := range tokens {
+		payload, err := postForm(client, hostname, cookies, "emoji.getInfo", map[string]string{"token": token, "name": "__slackmoji_probe__", "_x_mode": "online"}, "")
+		if err != nil {
+			continue
+		}
+		errorCode, _ := payload["error"].(string)
+		if errorCode != "invalid_auth" && errorCode != "not_authed" && errorCode != "token_revoked" {
+			return token, nil
+		}
+	}
+	return "", errors.New("Chrome has Slack request tokens, but none match this workspace session; refresh Slack in Chrome and retry")
+}
+
+func uploadEmoji(client *http.Client, hostname string, cookies map[string]string, token, name, image string) error {
+	payload, err := postForm(client, hostname, cookies, "emoji.add", map[string]string{"token": token, "name": name, "mode": "data", "search_args": "{}", "_x_reason": "add-custom-emoji-dialog-content", "_x_mode": "online"}, image)
+	if err != nil {
+		return err
+	}
+	return requireOK(payload, "upload")
+}
+
+func deleteEmoji(client *http.Client, hostname string, cookies map[string]string, token, name string) error {
+	payload, err := postForm(client, hostname, cookies, "emoji.remove", map[string]string{"token": token, "name": name, "_x_reason": "customize-emoji-remove", "_x_mode": "online"}, "")
+	if err != nil {
+		return err
+	}
+	return requireOK(payload, "delete")
+}
+
+func listEmoji(client *http.Client, hostname string, cookies map[string]string, token string, queries []string, page, count int) (map[string]any, error) {
+	queryJSON, _ := json.Marshal(queries)
+	payload, err := postForm(client, hostname, cookies, "emoji.adminList", map[string]string{"token": token, "page": strconv.Itoa(page), "count": strconv.Itoa(count), "queries": string(queryJSON), "user_ids": "[]", "_x_reason": "customize-emoji-new-query", "_x_mode": "online"}, "")
+	if err != nil {
+		return nil, err
+	}
+	return payload, requireOK(payload, "list")
+}
+
+func requireOK(payload map[string]any, action string) error {
+	if ok, _ := payload["ok"].(bool); !ok {
+		errorCode, _ := payload["error"].(string)
+		if errorCode == "" {
+			errorCode = "unknown error"
+		}
+		return fmt.Errorf("Slack could not %s emoji: %s", action, errorCode)
+	}
+	return nil
+}
+
+func printEmojiList(payload map[string]any, asJSON bool) error {
+	if asJSON {
+		encoded, _ := json.MarshalIndent(payload, "", "  ")
+		fmt.Println(string(encoded))
+		return nil
+	}
+	emojis, ok := payload["emoji"].([]any)
+	if !ok {
+		return errors.New("Slack returned an unexpected emoji list format; retry with --json")
+	}
+	for _, item := range emojis {
+		if emoji, ok := item.(map[string]any); ok {
+			if name, ok := emoji["name"].(string); ok {
+				fmt.Println(name)
+			}
+		}
+	}
+	if paging, ok := payload["paging"].(map[string]any); ok {
+		if total, ok := paging["total"].(float64); ok {
+			fmt.Fprintf(os.Stderr, "%.0f matching emoji\n", total)
+		}
+	}
+	return nil
+}
