@@ -10,7 +10,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -24,6 +23,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fatih/color"
+	"github.com/spf13/cobra"
 	_ "modernc.org/sqlite"
 )
 
@@ -44,153 +45,179 @@ type config struct {
 }
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "Error:", err)
+	if err := newRootCommand().Execute(); err != nil {
+		color.New(color.FgRed, color.Bold).Fprint(os.Stderr, "error: ")
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func run(args []string) error {
-	flags := flag.NewFlagSet("slackmoji", flag.ContinueOnError)
-	flags.SetOutput(os.Stderr)
+func newRootCommand() *cobra.Command {
 	var cfg config
-	flags.StringVar(&cfg.workspace, "workspace", "", "Slack subdomain (for example: cloudexchange-inc)")
-	flags.StringVar(&cfg.profile, "profile", "", "Chrome profile name (for example: Profile 1)")
-	flags.BoolVar(&cfg.yes, "yes", false, "Confirm a permanent delete")
-	flags.IntVar(&cfg.page, "page", 1, "List result page")
-	flags.IntVar(&cfg.count, "count", 100, "List results per page (1-100)")
-	flags.BoolVar(&cfg.json, "json", false, "Print complete JSON for list")
-	flags.Usage = usage
-	if err := flags.Parse(normalizeGlobalFlags(args)); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return nil
-		}
-		return err
+	root := &cobra.Command{
+		Use:   "slackmoji",
+		Short: color.New(color.Faint).Sprint("Manage custom Slack emoji through your signed-in Chrome session."),
+		Long: cliHelp(`
+slackmoji reads Chrome's Safe Storage secret from your Keychain, decrypts only
+the selected Slack workspace cookies in memory, and discovers Slack's browser
+request token from local storage. It never writes or displays credentials.
+		`),
+		Example: cliExample(`
+slackmoji add party-parrot ./party-parrot.gif --workspace cloudexchange-inc  # Upload an emoji
+slackmoji list party parrot                                                    # Search emoji
+slackmoji delete party-parrot --workspace cloudexchange-inc --yes             # Permanently delete
+		`),
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 0 {
+				return fmt.Errorf("invalid command: %q", args[0])
+			}
+			return cmd.Help()
+		},
 	}
-	rest := flags.Args()
-	if len(rest) == 0 || rest[0] == "help" || rest[0] == "-h" || rest[0] == "--help" {
-		usage()
-		return nil
-	}
-	command := rest[0]
-	rest = rest[1:]
-	if command != "add" && command != "delete" && command != "list" {
-		return fmt.Errorf("unknown command %q (expected add, delete, or list)", command)
-	}
-	if command == "add" && len(rest) != 2 {
-		return errors.New("usage: slackmoji [--workspace WORKSPACE] add EMOJI_NAME IMAGE")
-	}
-	if command == "delete" && len(rest) != 1 {
-		return errors.New("usage: slackmoji [--workspace WORKSPACE] delete EMOJI_NAME --yes")
-	}
-	if command == "list" && cfg.page < 1 || command == "list" && (cfg.count < 1 || cfg.count > 100) {
-		return errors.New("--page must be positive and --count must be between 1 and 100")
-	}
-	if command == "delete" && !cfg.yes {
-		return errors.New("refusing to delete without --yes")
-	}
-	if (command == "add" || command == "delete") && !emojiNamePattern.MatchString(rest[0]) {
-		return errors.New("emoji name must be 1-79 lowercase letters, numbers, hyphens, or underscores")
-	}
-	if command == "add" {
-		if info, err := os.Stat(rest[1]); err != nil || info.IsDir() {
-			return fmt.Errorf("image not found: %s", rest[1])
-		}
-	}
+	root.PersistentFlags().StringVarP(&cfg.workspace, "workspace", "w", "", "Slack subdomain, e.g. cloudexchange-inc")
+	root.PersistentFlags().StringVarP(&cfg.profile, "profile", "p", "", "Chrome profile, e.g. 'Profile 1'")
+	root.AddCommand(newAddCommand(&cfg), newDeleteCommand(&cfg), newListCommand(&cfg))
+	return root
+}
 
-	chromeRoot, err := chromeRoot()
+func newAddCommand(cfg *config) *cobra.Command {
+	return &cobra.Command{
+		Use:     "add <emoji-name> <image>",
+		Aliases: []string{"upload"},
+		Short:   "upload a custom emoji",
+		Args:    cobra.ExactArgs(2),
+		RunE: func(_ *cobra.Command, args []string) error {
+			if !emojiNamePattern.MatchString(args[0]) {
+				return errors.New("emoji name must be 1-79 lowercase letters, numbers, hyphens, or underscores")
+			}
+			if info, err := os.Stat(args[1]); err != nil || info.IsDir() {
+				return fmt.Errorf("image not found: %s", args[1])
+			}
+			client, hostname, cookies, token, err := connect(*cfg)
+			if err != nil {
+				return err
+			}
+			if err := uploadEmoji(client, hostname, cookies, token, args[0], args[1]); err != nil {
+				return err
+			}
+			color.New(color.FgGreen, color.Bold).Printf("Uploaded :%s:", args[0])
+			fmt.Printf(" to %s\n", hostname)
+			return nil
+		},
+	}
+}
+
+func newDeleteCommand(cfg *config) *cobra.Command {
+	command := &cobra.Command{
+		Use:   "delete <emoji-name>",
+		Short: "permanently delete a custom emoji",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			if !cfg.yes {
+				return errors.New("refusing to delete without --yes")
+			}
+			if !emojiNamePattern.MatchString(args[0]) {
+				return errors.New("emoji name must be 1-79 lowercase letters, numbers, hyphens, or underscores")
+			}
+			client, hostname, cookies, token, err := connect(*cfg)
+			if err != nil {
+				return err
+			}
+			if err := deleteEmoji(client, hostname, cookies, token, args[0]); err != nil {
+				return err
+			}
+			color.New(color.FgYellow, color.Bold).Printf("Deleted :%s:", args[0])
+			fmt.Printf(" from %s\n", hostname)
+			return nil
+		},
+	}
+	command.Flags().BoolVar(&cfg.yes, "yes", false, "confirm permanent deletion")
+	return command
+}
+
+func newListCommand(cfg *config) *cobra.Command {
+	command := &cobra.Command{
+		Use:   "list [search-term...]",
+		Short: "list custom emoji, optionally filtered by search terms",
+		Long: cliHelp(`
+List custom emoji in the selected Slack workspace. Search terms are passed to
+Slack as individual queries; omit them to list all custom emoji.
+		`),
+		Example: cliExample(`
+slackmoji list                         # List all custom emoji
+slackmoji list party parrot            # Search using two terms
+slackmoji list --page 2 --count 50     # Request another page
+slackmoji list --json shellder          # Print Slack's complete response
+		`),
+		RunE: func(_ *cobra.Command, args []string) error {
+			if cfg.page < 1 || cfg.count < 1 || cfg.count > 100 {
+				return errors.New("--page must be positive and --count must be between 1 and 100")
+			}
+			client, hostname, cookies, token, err := connect(*cfg)
+			if err != nil {
+				return err
+			}
+			payload, err := listEmoji(client, hostname, cookies, token, args, cfg.page, cfg.count)
+			if err != nil {
+				return err
+			}
+			return printEmojiList(payload, cfg.json)
+		},
+	}
+	command.Flags().IntVar(&cfg.page, "page", 1, "results page")
+	command.Flags().IntVar(&cfg.count, "count", 100, "results per page (1-100)")
+	command.Flags().BoolVar(&cfg.json, "json", false, "print Slack's complete JSON response")
+	return command
+}
+
+func connect(cfg config) (*http.Client, string, map[string]string, string, error) {
+	root, err := chromeRoot()
 	if err != nil {
-		return err
+		return nil, "", nil, "", err
 	}
 	key, err := chromeCookieKey()
 	if err != nil {
-		return err
+		return nil, "", nil, "", err
 	}
 	if cfg.workspace == "" {
-		cfg.workspace, err = chooseWorkspace(chromeRoot, cfg.profile)
+		cfg.workspace, err = chooseWorkspace(root, cfg.profile)
 		if err != nil {
-			return err
+			return nil, "", nil, "", err
 		}
 	}
 	hostname, err := normalizeWorkspace(cfg.workspace)
 	if err != nil {
-		return err
+		return nil, "", nil, "", err
 	}
-	profile, cookies, err := chooseProfile(chromeRoot, cfg.profile, hostname, key)
+	profile, cookies, err := chooseProfile(root, cfg.profile, hostname, key)
 	if err != nil {
-		return err
+		return nil, "", nil, "", err
 	}
 	client := &http.Client{Timeout: 30 * time.Second}
 	token, err := selectToken(client, hostname, cookies, profile)
 	if err != nil {
-		return err
+		return nil, "", nil, "", err
 	}
-
-	switch command {
-	case "add":
-		if err := uploadEmoji(client, hostname, cookies, token, rest[0], rest[1]); err != nil {
-			return err
-		}
-		fmt.Printf("Uploaded :%s: to %s\n", rest[0], hostname)
-	case "delete":
-		if err := deleteEmoji(client, hostname, cookies, token, rest[0]); err != nil {
-			return err
-		}
-		fmt.Printf("Deleted :%s: from %s\n", rest[0], hostname)
-	case "list":
-		payload, err := listEmoji(client, hostname, cookies, token, rest, cfg.page, cfg.count)
-		if err != nil {
-			return err
-		}
-		return printEmojiList(payload, cfg.json)
-	}
-	return nil
+	return client, hostname, cookies, token, nil
 }
 
-// Go's flag package stops parsing at the command name. Accept global flags on
-// either side of it so `slackmoji delete name --yes` works naturally.
-func normalizeGlobalFlags(args []string) []string {
-	valueFlags := map[string]bool{"--workspace": true, "--profile": true, "--page": true, "--count": true}
-	boolFlags := map[string]bool{"--yes": true, "--json": true, "--help": true, "-h": true}
-	var flags, positional []string
-	for i := 0; i < len(args); i++ {
-		argument := args[i]
-		name := argument
-		if equals := strings.IndexByte(argument, '='); equals >= 0 {
-			name = argument[:equals]
-		}
-		if boolFlags[name] || strings.Contains(argument, "=") && valueFlags[name] {
-			flags = append(flags, argument)
-			continue
-		}
-		if valueFlags[name] {
-			flags = append(flags, argument)
-			if i+1 < len(args) {
-				i++
-				flags = append(flags, args[i])
-			}
-			continue
-		}
-		positional = append(positional, argument)
-	}
-	return append(flags, positional...)
+func cliHelp(text string) string {
+	return color.New(color.Faint).Sprint("Docs: https://github.com/peterldowns/slackmoji") + "\n\nHelp:\n" + cliExample(text)
 }
 
-func usage() {
-	fmt.Fprint(os.Stderr, `slackmoji manages custom Slack emoji through your signed-in Chrome session.
-
-Usage:
-  slackmoji [--workspace WORKSPACE] [--profile PROFILE] add EMOJI_NAME IMAGE
-  slackmoji [--workspace WORKSPACE] [--profile PROFILE] delete EMOJI_NAME --yes
-  slackmoji [--workspace WORKSPACE] [--profile PROFILE] [--page N] [--count N] [--json] list [SEARCH_TERM...]
-
-When --workspace is omitted, slackmoji interactively offers Slack workspaces found in Chrome.
-
-Examples:
-  slackmoji --workspace cloudexchange-inc add party-parrot ./party-parrot.gif
-  slackmoji list party parrot
-  slackmoji --workspace cloudexchange-inc delete party-parrot --yes
-`)
+func cliExample(text string) string {
+	var lines []string
+	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), "#", 2)
+		if len(parts) == 2 {
+			lines = append(lines, fmt.Sprintf("  %s%s", strings.TrimRight(parts[0], " "), color.New(color.Faint).Sprintf(" # %s", strings.TrimSpace(parts[1]))))
+		} else {
+			lines = append(lines, "  "+parts[0])
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func chromeRoot() (string, error) {
