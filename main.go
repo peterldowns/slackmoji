@@ -163,13 +163,9 @@ slackmoji list --json shellder          # Print Slack's complete response
 			if err != nil {
 				return err
 			}
-			uploaderIDs, uploaderNames := splitUploaderFilters(cfg.uploader)
-			payload, err := listEmoji(client, hostname, cookies, token, args, uploaderIDs, cfg.page, cfg.count)
+			payload, err := listEmojiWithUploaderFilters(client, hostname, cookies, token, args, cfg.uploader, cfg.page, cfg.count)
 			if err != nil {
 				return err
-			}
-			if len(uploaderNames) > 0 {
-				payload = filterEmojiByUploaderName(payload, uploaderNames)
 			}
 			return printEmojiList(payload, cfg.json, cfg.details)
 		},
@@ -665,6 +661,142 @@ func listEmoji(client *http.Client, hostname string, cookies map[string]string, 
 	return payload, requireOK(payload, "list")
 }
 
+func listEmojiWithUploaderFilters(client *http.Client, hostname string, cookies map[string]string, token string, queries, filters []string, page, count int) (map[string]any, error) {
+	uploaderIDs, uploaderNames := splitUploaderFilters(filters)
+	if len(uploaderNames) == 0 {
+		return listEmoji(client, hostname, cookies, token, queries, uploaderIDs, page, count)
+	}
+
+	// The emoji endpoint needs IDs. Request one item first only to discover the
+	// workspace's team ID, then resolve display names through Slack's user search.
+	probe, err := listEmoji(client, hostname, cookies, token, nil, nil, 1, 1)
+	if err != nil {
+		return nil, err
+	}
+	teamID := teamIDFromEmojiList(probe)
+	if teamID == "" {
+		// Preserve a useful result if Slack returns no emoji from which to learn a
+		// team ID; name matching remains a client-side fallback in this rare case.
+		payload, err := listEmoji(client, hostname, cookies, token, queries, uploaderIDs, page, count)
+		if err != nil {
+			return nil, err
+		}
+		return filterEmojiByUploaderName(payload, uploaderNames), nil
+	}
+	resolvedIDs, err := searchUserIDs(client, hostname, cookies, token, teamID, uploaderNames)
+	if err != nil {
+		return nil, err
+	}
+	if len(resolvedIDs) == 0 {
+		payload, err := listEmoji(client, hostname, cookies, token, queries, uploaderIDs, page, count)
+		if err != nil {
+			return nil, err
+		}
+		return filterEmojiByUploaderName(payload, uploaderNames), nil
+	}
+	uploaderIDs = append(uploaderIDs, resolvedIDs...)
+	return listEmoji(client, hostname, cookies, token, queries, uniqueStrings(uploaderIDs), page, count)
+}
+
+func teamIDFromEmojiList(payload map[string]any) string {
+	emojis, _ := payload["emoji"].([]any)
+	for _, item := range emojis {
+		if emoji, ok := item.(map[string]any); ok {
+			if teamID := stringValue(emoji, "team_id"); teamID != "" {
+				return teamID
+			}
+		}
+	}
+	return ""
+}
+
+func searchUserIDs(client *http.Client, hostname string, cookies map[string]string, token, teamID string, queries []string) ([]string, error) {
+	ids := make([]string, 0)
+	for _, query := range queries {
+		body, err := json.Marshal(map[string]any{
+			"token":                      token,
+			"include_profile_only_users": true,
+			"query":                      query,
+			"count":                      100,
+			"fuzz":                       1,
+			"enable_workspace_ranking":   true,
+			"filter":                     "team",
+		})
+		if err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequest(http.MethodPost, "https://edgeapi.slack.com/cache/"+teamID+"/users/search?_x_app_name=non-gantry", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header = requestHeaders(hostname, cookies)
+		req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
+		response, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+			response.Body.Close()
+			return nil, errors.New("Slack rejected the Chrome session; refresh Slack in Chrome and retry")
+		}
+		if response.StatusCode < 200 || response.StatusCode > 299 {
+			response.Body.Close()
+			return nil, fmt.Errorf("Slack user search returned HTTP %d", response.StatusCode)
+		}
+		var payload any
+		decodeErr := json.NewDecoder(response.Body).Decode(&payload)
+		response.Body.Close()
+		if decodeErr != nil {
+			return nil, errors.New("Slack user search returned a non-JSON response")
+		}
+		ids = append(ids, userIDsInValue(payload, query)...)
+	}
+	return uniqueStrings(ids), nil
+}
+
+func userIDsInValue(value any, query string) []string {
+	var ids []string
+	switch value := value.(type) {
+	case map[string]any:
+		if id, ok := value["id"].(string); ok && userIDPattern.MatchString(id) && strings.Contains(strings.ToLower(userSearchText(value)), query) {
+			ids = append(ids, id)
+		}
+		for _, child := range value {
+			ids = append(ids, userIDsInValue(child, query)...)
+		}
+	case []any:
+		for _, child := range value {
+			ids = append(ids, userIDsInValue(child, query)...)
+		}
+	}
+	return ids
+}
+
+func userSearchText(value map[string]any) string {
+	var text []string
+	for _, key := range []string{"name", "real_name", "display_name", "email"} {
+		if string, ok := value[key].(string); ok {
+			text = append(text, string)
+		}
+	}
+	if profile, ok := value["profile"].(map[string]any); ok {
+		text = append(text, userSearchText(profile))
+	}
+	return strings.Join(text, " ")
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	unique := make([]string, 0, len(values))
+	for _, value := range values {
+		if !seen[value] {
+			seen[value] = true
+			unique = append(unique, value)
+		}
+	}
+	return unique
+}
+
 func splitUploaderFilters(filters []string) (userIDs, names []string) {
 	for _, filter := range filters {
 		filter = strings.TrimSpace(filter)
@@ -692,10 +824,10 @@ func filterEmojiByUploaderName(payload map[string]any, filters []string) map[str
 			continue
 		}
 		uploader := strings.ToLower(stringValue(emoji, "user_display_name") + " " + stringValue(emoji, "user_id"))
-		matches := true
+		matches := false
 		for _, filter := range filters {
-			if !strings.Contains(uploader, filter) {
-				matches = false
+			if strings.Contains(uploader, filter) {
+				matches = true
 				break
 			}
 		}
