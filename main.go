@@ -211,8 +211,9 @@ func newDeleteCommand(cfg *config) *cobra.Command {
 
 func newListCommand(cfg *config) *cobra.Command {
 	command := &cobra.Command{
-		Use:   "list [search-term...]",
-		Short: "list custom emoji, optionally filtered by search terms",
+		Use:     "list [search-term...]",
+		Aliases: []string{"search"},
+		Short:   "list custom emoji, optionally filtered by search terms",
 		Long: cliHelp(`
 List custom emoji in the selected Slack workspace. Search terms are passed to
 Slack as individual queries; omit them to list all custom emoji.
