@@ -443,7 +443,9 @@ func slackCookieHosts(profilePath string) []string {
 		return nil
 	}
 	defer db.Close()
-	rows, err := db.Query(`SELECT DISTINCT host_key FROM cookies WHERE name = 'd' AND host_key LIKE '%.slack.com'`)
+	// Slack's authenticated `d` cookie is commonly scoped to .slack.com, so it
+	// does not identify the workspace by itself. Other workspace cookies do.
+	rows, err := db.Query(`SELECT DISTINCT host_key FROM cookies WHERE host_key LIKE '%.slack.com'`)
 	if err != nil {
 		return nil
 	}
