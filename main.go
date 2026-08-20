@@ -33,6 +33,7 @@ const userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/5
 var (
 	xoxcPattern      = regexp.MustCompile(`xoxc-[A-Za-z0-9-]+`)
 	emojiNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,78}$`)
+	userIDPattern    = regexp.MustCompile(`^[UW][A-Z0-9]+$`)
 )
 
 type config struct {
@@ -43,6 +44,7 @@ type config struct {
 	count     int
 	json      bool
 	details   bool
+	uploader  []string
 }
 
 func main() {
@@ -150,6 +152,7 @@ Slack as individual queries; omit them to list all custom emoji.
 slackmoji list                         # List all custom emoji
 slackmoji list party parrot            # Search using two terms
 slackmoji list --page 2 --count 50     # Request another page
+slackmoji list --uploader "Peter Downs" # Filter by uploader name
 slackmoji list --json shellder          # Print Slack's complete response
 		`),
 		RunE: func(_ *cobra.Command, args []string) error {
@@ -160,9 +163,13 @@ slackmoji list --json shellder          # Print Slack's complete response
 			if err != nil {
 				return err
 			}
-			payload, err := listEmoji(client, hostname, cookies, token, args, cfg.page, cfg.count)
+			uploaderIDs, uploaderNames := splitUploaderFilters(cfg.uploader)
+			payload, err := listEmoji(client, hostname, cookies, token, args, uploaderIDs, cfg.page, cfg.count)
 			if err != nil {
 				return err
+			}
+			if len(uploaderNames) > 0 {
+				payload = filterEmojiByUploaderName(payload, uploaderNames)
 			}
 			return printEmojiList(payload, cfg.json, cfg.details)
 		},
@@ -171,6 +178,7 @@ slackmoji list --json shellder          # Print Slack's complete response
 	command.Flags().IntVar(&cfg.count, "count", 100, "results per page (1-100)")
 	command.Flags().BoolVar(&cfg.json, "json", false, "print Slack's complete JSON response")
 	command.Flags().BoolVar(&cfg.details, "details", false, "include image URLs and Slack IDs")
+	command.Flags().StringSliceVar(&cfg.uploader, "uploader", nil, "filter by uploader name or Slack user ID (repeatable)")
 	return command
 }
 
@@ -647,13 +655,69 @@ func deleteEmoji(client *http.Client, hostname string, cookies map[string]string
 	return requireOK(payload, "delete")
 }
 
-func listEmoji(client *http.Client, hostname string, cookies map[string]string, token string, queries []string, page, count int) (map[string]any, error) {
+func listEmoji(client *http.Client, hostname string, cookies map[string]string, token string, queries, userIDs []string, page, count int) (map[string]any, error) {
 	queryJSON, _ := json.Marshal(queries)
-	payload, err := postForm(client, hostname, cookies, "emoji.adminList", map[string]string{"token": token, "page": strconv.Itoa(page), "count": strconv.Itoa(count), "queries": string(queryJSON), "user_ids": "[]", "_x_reason": "customize-emoji-new-query", "_x_mode": "online"}, "")
+	userIDsJSON, _ := json.Marshal(userIDs)
+	payload, err := postForm(client, hostname, cookies, "emoji.adminList", map[string]string{"token": token, "page": strconv.Itoa(page), "count": strconv.Itoa(count), "queries": string(queryJSON), "user_ids": string(userIDsJSON), "_x_reason": "customize-emoji-new-query", "_x_mode": "online"}, "")
 	if err != nil {
 		return nil, err
 	}
 	return payload, requireOK(payload, "list")
+}
+
+func splitUploaderFilters(filters []string) (userIDs, names []string) {
+	for _, filter := range filters {
+		filter = strings.TrimSpace(filter)
+		if filter == "" {
+			continue
+		}
+		if userIDPattern.MatchString(filter) {
+			userIDs = append(userIDs, filter)
+		} else {
+			names = append(names, strings.ToLower(filter))
+		}
+	}
+	return userIDs, names
+}
+
+func filterEmojiByUploaderName(payload map[string]any, filters []string) map[string]any {
+	emojis, ok := payload["emoji"].([]any)
+	if !ok {
+		return payload
+	}
+	filtered := make([]any, 0, len(emojis))
+	for _, item := range emojis {
+		emoji, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		uploader := strings.ToLower(stringValue(emoji, "user_display_name") + " " + stringValue(emoji, "user_id"))
+		matches := true
+		for _, filter := range filters {
+			if !strings.Contains(uploader, filter) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			filtered = append(filtered, item)
+		}
+	}
+	copy := make(map[string]any, len(payload))
+	for key, value := range payload {
+		copy[key] = value
+	}
+	copy["emoji"] = filtered
+	copy["custom_emoji_total_count"] = len(filtered)
+	if paging, ok := payload["paging"].(map[string]any); ok {
+		pagingCopy := make(map[string]any, len(paging))
+		for key, value := range paging {
+			pagingCopy[key] = value
+		}
+		pagingCopy["total"] = len(filtered)
+		copy["paging"] = pagingCopy
+	}
+	return copy
 }
 
 func requireOK(payload map[string]any, action string) error {
