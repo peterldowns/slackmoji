@@ -7,6 +7,12 @@ It reads Chrome's Safe Storage secret from your Keychain, decrypts only the sele
 ## Install
 
 ```sh
+brew install peterldowns/tap/slackmoji
+```
+
+Or install with Go:
+
+```sh
 go install github.com/peterldowns/slackmoji@latest
 ```
 

@@ -70,11 +70,15 @@ func main() {
 	}
 }
 
+func versionString() string {
+	return fmt.Sprintf("%s+commit.%s", Version, Commit)
+}
+
 func newRootCommand() *cobra.Command {
 	var cfg config
 	root := &cobra.Command{
 		Use:     "slackmoji",
-		Version: fmt.Sprintf("%s+commit.%s", Version, Commit),
+		Version: versionString(),
 		Short:   color.New(color.Faint).Sprint("Manage custom Slack emoji through your signed-in Chrome session."),
 		Long: cliHelp(`
 slackmoji reads Chrome's Safe Storage secret from your Keychain, decrypts only
@@ -99,8 +103,19 @@ slackmoji delete party-parrot --workspace cloudexchange-inc --yes             # 
 	root.SetVersionTemplate("{{.Version}}\n")
 	root.PersistentFlags().StringVarP(&cfg.workspace, "workspace", "w", "", "Slack subdomain, e.g. cloudexchange-inc")
 	root.PersistentFlags().StringVarP(&cfg.profile, "profile", "p", "", "Chrome profile, e.g. 'Profile 1'")
-	root.AddCommand(newAddCommand(&cfg), newDeleteCommand(&cfg), newDownloadCommand(&cfg), newListCommand(&cfg))
+	root.AddCommand(newAddCommand(&cfg), newDeleteCommand(&cfg), newDownloadCommand(&cfg), newListCommand(&cfg), newVersionCommand())
 	return root
+}
+
+func newVersionCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "print the version of this binary",
+		Args:  cobra.NoArgs,
+		Run: func(_ *cobra.Command, _ []string) {
+			fmt.Println(versionString())
+		},
+	}
 }
 
 func newDownloadCommand(cfg *config) *cobra.Command {
