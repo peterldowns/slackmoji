@@ -42,6 +42,7 @@ type config struct {
 	page      int
 	count     int
 	json      bool
+	details   bool
 }
 
 func main() {
@@ -163,12 +164,13 @@ slackmoji list --json shellder          # Print Slack's complete response
 			if err != nil {
 				return err
 			}
-			return printEmojiList(payload, cfg.json)
+			return printEmojiList(payload, cfg.json, cfg.details)
 		},
 	}
 	command.Flags().IntVar(&cfg.page, "page", 1, "results page")
 	command.Flags().IntVar(&cfg.count, "count", 100, "results per page (1-100)")
 	command.Flags().BoolVar(&cfg.json, "json", false, "print Slack's complete JSON response")
+	command.Flags().BoolVar(&cfg.details, "details", false, "include image URLs and Slack IDs")
 	return command
 }
 
@@ -665,7 +667,7 @@ func requireOK(payload map[string]any, action string) error {
 	return nil
 }
 
-func printEmojiList(payload map[string]any, asJSON bool) error {
+func printEmojiList(payload map[string]any, asJSON, details bool) error {
 	if asJSON {
 		encoded, _ := json.MarshalIndent(payload, "", "  ")
 		fmt.Println(string(encoded))
@@ -675,11 +677,28 @@ func printEmojiList(payload map[string]any, asJSON bool) error {
 	if !ok {
 		return errors.New("Slack returned an unexpected emoji list format; retry with --json")
 	}
+	if len(emojis) == 0 {
+		fmt.Fprintln(os.Stderr, color.New(color.Faint).Sprint("No matching emoji."))
+		return nil
+	}
+	header := color.New(color.Faint, color.Bold)
+	header.Printf("%-24s %-22s %-20s %s\n", "EMOJI", "UPLOADED BY", "CREATED", "DETAILS")
 	for _, item := range emojis {
-		if emoji, ok := item.(map[string]any); ok {
-			if name, ok := emoji["name"].(string); ok {
-				fmt.Println(name)
-			}
+		emoji, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := stringValue(emoji, "name")
+		uploader := stringValue(emoji, "user_display_name")
+		if uploader == "" {
+			uploader = stringValue(emoji, "user_id")
+		}
+		created := createdAt(emoji)
+		description := emojiDescription(emoji)
+		color.New(color.FgCyan, color.Bold).Print(padRight(":"+name+":", 24))
+		fmt.Printf(" %-22s %-20s %s\n", truncate(uploader, 22), created, description)
+		if details {
+			printEmojiDetails(emoji)
 		}
 	}
 	if paging, ok := payload["paging"].(map[string]any); ok {
@@ -688,4 +707,85 @@ func printEmojiList(payload map[string]any, asJSON bool) error {
 		}
 	}
 	return nil
+}
+
+func stringValue(values map[string]any, key string) string {
+	value, _ := values[key].(string)
+	return value
+}
+
+func createdAt(emoji map[string]any) string {
+	created, ok := emoji["created"].(float64)
+	if !ok || created == 0 {
+		return "unknown"
+	}
+	return time.Unix(int64(created), 0).Local().Format("2006-01-02 15:04")
+}
+
+func emojiDescription(emoji map[string]any) string {
+	var parts []string
+	if aliasFor := stringValue(emoji, "alias_for"); aliasFor != "" {
+		parts = append(parts, "alias → :"+aliasFor+":")
+	} else {
+		parts = append(parts, "image")
+	}
+	if isTruthy(emoji["is_bad"]) {
+		parts = append(parts, "bad")
+	}
+	if isTruthy(emoji["can_delete"]) {
+		parts = append(parts, "deletable")
+	}
+	return strings.Join(parts, " · ")
+}
+
+func printEmojiDetails(emoji map[string]any) {
+	metadata := []string{
+		"user: " + stringValue(emoji, "user_id"),
+		"team: " + stringValue(emoji, "team_id"),
+		"url: " + stringValue(emoji, "url"),
+	}
+	if synonyms, ok := emoji["synonyms"].([]any); ok && len(synonyms) > 0 {
+		var names []string
+		for _, synonym := range synonyms {
+			if value, ok := synonym.(string); ok {
+				names = append(names, ":"+value+":")
+			}
+		}
+		if len(names) > 0 {
+			metadata = append(metadata, "synonyms: "+strings.Join(names, ", "))
+		}
+	}
+	for _, detail := range metadata {
+		if strings.TrimSpace(strings.TrimPrefix(detail, "url:")) != "" && !strings.HasSuffix(detail, ": ") {
+			fmt.Fprintln(os.Stdout, color.New(color.Faint).Sprint("  "+detail))
+		}
+	}
+}
+
+func isTruthy(value any) bool {
+	switch value := value.(type) {
+	case bool:
+		return value
+	case float64:
+		return value != 0
+	default:
+		return false
+	}
+}
+
+func padRight(value string, width int) string {
+	if len(value) >= width {
+		return truncate(value, width)
+	}
+	return value + strings.Repeat(" ", width-len(value))
+}
+
+func truncate(value string, max int) string {
+	if len(value) <= max {
+		return value
+	}
+	if max <= 1 {
+		return value[:max]
+	}
+	return value[:max-1] + "…"
 }
